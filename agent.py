@@ -286,7 +286,70 @@ def extract_reflect_text(response) -> str:
 
     return str(text).strip()
 
+def recall_updated_context(employee_id: str) -> dict:
+    """
+    Re-recall the employee and team memory after a new update
+    has been retained in Hindsight.
+    """
 
+    personal_context = "No personal context available."
+    team_context = "No team context available."
+
+    if not hindsight_client:
+        return {
+            "personal_context": personal_context,
+            "team_context": team_context,
+        }
+
+    # --------------------------------------------------------
+    # Employee memory
+    # --------------------------------------------------------
+
+    try:
+        personal_recall_resp = hindsight_client.recall(
+            bank_id=employee_id,
+            query=(
+                "What are the most recent operational updates, "
+                "completed work, blockers, and employee responses?"
+            ),
+        )
+
+        personal_context = extract_recall_text(
+            personal_recall_resp
+        )
+
+    except Exception as e:
+        logging.warning(
+            f"Hindsight personal refresh failed "
+            f"for '{employee_id}': {e}"
+        )
+
+    # --------------------------------------------------------
+    # Team memory
+    # --------------------------------------------------------
+
+    try:
+        team_recall_resp = hindsight_client.recall(
+            bank_id="team_ops",
+            query=(
+                "What are the most recent cross-team operational "
+                "updates, completed work, blockers, and dependencies?"
+            ),
+        )
+
+        team_context = extract_recall_text(
+            team_recall_resp
+        )
+
+    except Exception as e:
+        logging.warning(
+            f"Hindsight team_ops refresh failed: {e}"
+        )
+
+    return {
+        "personal_context": personal_context,
+        "team_context": team_context,
+    }
 # ============================================================
 # PROACTIVE CHECK-IN QUESTION GENERATOR
 # ============================================================

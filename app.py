@@ -13,6 +13,7 @@ try:
     from agent import (
         get_proactive_checkin_question,
         process_employee_response,
+        recall_updated_context,
         generate_manager_dashboard_summary,
         EMPLOYEE_NAMES,
         HINDSIGHT_API_KEY,
@@ -232,45 +233,54 @@ if view_mode == "👤 Employee Check-In":
             # -------------------------------------------------------
 
             with st.expander(
-                "🔍 **View Raw Day 10 Signals** "
-                "(Automated GitHub / CI-CD Events)",
-                expanded=True,
-            ):
-
-                for signal in data["raw_signals"]:
-                    st.markdown(f"- `{signal}`")
-
-            # -------------------------------------------------------
-            # HINDSIGHT MEMORY
-            # -------------------------------------------------------
-
-            with st.expander(
                 "🧠 **View Hindsight TEMPR Recalled Context**",
                 expanded=False,
             ):
+
+                # Use freshly recalled memory after submission,
+                # otherwise use the original check-in recall.
+                if st.session_state.get("response_submitted", False):
+
+                    refreshed_context = st.session_state.get(
+                        "updated_context",
+                        {},
+                    )
+
+                    personal_context = refreshed_context.get(
+                        "personal_context",
+                        "No updated personal context available.",
+                    )
+
+                    team_context = refreshed_context.get(
+                        "team_context",
+                        "No updated team context available.",
+                    )
+
+                    st.success("🔄 Showing freshly recalled Hindsight memory")
+
+                else:
+
+                    personal_context = data.get(
+                        "personal_context",
+                        "No personal context available.",
+                    )
+
+                    team_context = data.get(
+                        "team_context",
+                        "No team context available.",
+                    )
 
                 st.markdown(
                     f"**Personal Memory (`{emp_key}`):**"
                 )
 
-                st.text(
-                    data.get(
-                        "personal_context",
-                        "No personal context available.",
-                    )
-                )
+                st.text(personal_context)
 
                 st.markdown(
                     "**Team Dependencies (`team_ops`):**"
                 )
 
-                st.text(
-                    data.get(
-                        "team_context",
-                        "No team context available.",
-                    )
-                )
-                
+                st.text(team_context)
             # -------------------------------------------------------
             # PROACTIVE QUESTION
             # -------------------------------------------------------
@@ -363,17 +373,22 @@ if view_mode == "👤 Employee Check-In":
                         "retaining into Hindsight memory banks..."
                     ):
 
-                        result = process_employee_response(
-                            emp_key,
-                            user_reply,
-                            data["proactive_question"],
-                        )
+                       result = process_employee_response(
+                        emp_key,
+                        user_reply,
+                        data["proactive_question"],
+                    )
 
-                        st.session_state["result_data"] = result
+                    # Re-recall Hindsight after the retain operation
+                    updated_context = recall_updated_context(emp_key)
 
-                        st.session_state[
-                            "response_submitted"
-                        ] = True
+                    st.session_state["result_data"] = result
+
+                    st.session_state["updated_context"] = updated_context
+
+                    st.session_state[
+                        "response_submitted"
+                    ] = True
 
             # -------------------------------------------------------
             # RETENTION RESULT
