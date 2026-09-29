@@ -1,13 +1,16 @@
 import os
+import sys
 import logging
+import asyncio
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
+from openai import OpenAI
 
-
-# ============================================================
-# LOGGING & ENVIRONMENT
-# ============================================================
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,13 +19,7 @@ logging.basicConfig(
 
 load_dotenv()
 
-
-# ============================================================
-# API KEYS
-# ============================================================
-
 HINDSIGHT_API_KEY = os.getenv("HINDSIGHT_API_KEY")
-
 HINDSIGHT_BASE_URL = os.getenv(
     "HINDSIGHT_BASE_URL",
     "https://api.hindsight.vectorize.io"
@@ -30,22 +27,23 @@ HINDSIGHT_BASE_URL = os.getenv(
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+MODEL_NAME = "openai/gpt-oss-20b"
 
-# ============================================================
-# MOCK EVENTS
-# ============================================================
+
+# =====================================================================
+# MOCK SIGNALS
+# =====================================================================
 
 try:
     from mock_events import (
         MOCK_DAY10_SIGNALS,
         EMPLOYEE_NAMES,
-        get_mock_signals_for_employee
+        get_mock_signals_for_employee,
     )
 
 except ImportError:
     logging.warning(
-        "mock_events.py not found. "
-        "Falling back to default mock signal handler."
+        "mock_events.py not found. Using fallback mock signal handler."
     )
 
     MOCK_DAY10_SIGNALS = {}
@@ -53,29 +51,43 @@ except ImportError:
     EMPLOYEE_NAMES = {
         "emp_alice": "Alice (Backend Lead)",
         "emp_bob": "Bob (Frontend Lead)",
-        "emp_charlie": "Charlie (DevOps Lead)"
+        "emp_charlie": "Charlie (DevOps Lead)",
     }
 
-    def get_mock_signals_for_employee(emp_id):
+    def get_mock_signals_for_employee(employee_id: str) -> list:
         return ["No background signals recorded today."]
 
 
-# ============================================================
+# =====================================================================
 # CLIENT INITIALIZATION
-# ============================================================
+# =====================================================================
+
+# IMPORTANT:
+# We intentionally do NOT keep a long-lived Hindsight HTTP client here.
+#
+# Streamlit reruns can interact badly with the aiohttp session used by
+# the Hindsight SDK when the synchronous wrapper is reused across
+# different execution contexts.
+#
+# Instead, every Hindsight operation creates its own client inside
+# its own asyncio event loop and closes it afterwards.
 
 hindsight_client = None
 groq_client = None
 
 
 def initialize_clients():
+    """
+    Initialize the Groq client.
 
-    global hindsight_client
+    Hindsight is initialized lazily inside each async operation.
+    """
+
     global groq_client
 
-    # --------------------------------------------------------
-    # Hindsight
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Validate Hindsight configuration
+    # ---------------------------------------------------------------
 
     if (
         not HINDSIGHT_API_KEY
@@ -83,38 +95,15 @@ def initialize_clients():
         in ["", "your_hindsight_api_key_here"]
     ):
         logging.error(
-            "Missing or invalid HINDSIGHT_API_KEY "
-            "in environment or .env file."
+            "Missing or invalid HINDSIGHT_API_KEY."
         )
-
         print(
-            "❌ ERROR: HINDSIGHT_API_KEY is missing. "
-            "Please set it in your .env file."
+            "❌ ERROR: HINDSIGHT_API_KEY is missing."
         )
 
-    else:
-        try:
-            from hindsight_client import Hindsight
-
-            hindsight_client = Hindsight(
-                base_url=HINDSIGHT_BASE_URL,
-                api_key=HINDSIGHT_API_KEY
-            )
-
-        except Exception as e:
-
-            logging.error(
-                "Failed to initialize Hindsight client."
-            )
-
-            print(
-                f"❌ ERROR: Could not connect to Hindsight Cloud. "
-                f"({type(e).__name__})"
-            )
-
-    # --------------------------------------------------------
-    # Groq
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Validate Groq configuration
+    # ---------------------------------------------------------------
 
     if (
         not GROQ_API_KEY
@@ -122,56 +111,179 @@ def initialize_clients():
         in ["", "gsk_your_groq_api_key_here"]
     ):
         logging.error(
-            "Missing or invalid GROQ_API_KEY "
-            "in environment or .env file."
+            "Missing or invalid GROQ_API_KEY."
+        )
+        print(
+            "❌ ERROR: GROQ_API_KEY is missing."
         )
 
-        print(
-            "❌ ERROR: GROQ_API_KEY is missing. "
-            "Please set it in your .env file."
-        )
+        groq_client = None
 
     else:
         try:
-            from openai import OpenAI
-
             groq_client = OpenAI(
                 base_url="https://api.groq.com/openai/v1",
-                api_key=GROQ_API_KEY
+                api_key=GROQ_API_KEY,
             )
 
         except Exception as e:
-
             logging.error(
-                "Failed to initialize Groq "
-                "OpenAI-compatible client."
+                "Failed to initialize Groq client."
             )
-
             print(
                 f"❌ ERROR: Could not initialize Groq client. "
                 f"({type(e).__name__})"
             )
 
+            groq_client = None
 
-# Initialize clients
+
 initialize_clients()
 
 
-MODEL_NAME = "openai/gpt-oss-20b"
+# =====================================================================
+# HINDSIGHT ASYNC BRIDGE
+# =====================================================================
+
+def _run_hindsight_operation(operation, *args, **kwargs):
+    """
+    Run ONE Hindsight async operation inside a completely isolated
+    asyncio event loop.
+
+    This is intentionally used instead of the Hindsight synchronous
+    wrappers because Streamlit can rerun code in different execution
+    contexts.
+
+    The Hindsight client is created INSIDE the same event loop in which
+    the async request executes and is closed before the loop exits.
+
+    This prevents errors such as:
+
+        Timeout context manager should be used inside a task
+
+    and:
+
+        Unclosed client session
+    """
+
+    if not HINDSIGHT_API_KEY:
+        raise RuntimeError(
+            "HINDSIGHT_API_KEY is not configured."
+        )
+
+    async def _operation():
+
+        from hindsight_client import Hindsight
+
+        client = Hindsight(
+            base_url=HINDSIGHT_BASE_URL,
+            api_key=HINDSIGHT_API_KEY,
+        )
+
+        try:
+            result = await operation(
+                client,
+                *args,
+                **kwargs,
+            )
+
+            return result
+
+        finally:
+            try:
+                await client.aclose()
+
+            except Exception as close_error:
+                logging.warning(
+                    "Hindsight async client close failed: %s",
+                    close_error,
+                )
+
+    return asyncio.run(_operation())
 
 
-# ============================================================
-# HINDSIGHT RECALL PARSER
-# ============================================================
+def _hindsight_recall(
+    bank_id: str,
+    query: str,
+):
+    """
+    Streamlit-safe Hindsight recall.
+    """
+
+    async def operation(
+        client,
+        bank_id,
+        query,
+    ):
+        return await client.arecall(
+            bank_id=bank_id,
+            query=query,
+        )
+
+    return _run_hindsight_operation(
+        operation,
+        bank_id,
+        query,
+    )
+
+
+def _hindsight_retain(
+    bank_id: str,
+    content: str,
+):
+    """
+    Streamlit-safe Hindsight retain.
+    """
+
+    async def operation(
+        client,
+        bank_id,
+        content,
+    ):
+        return await client.aretain(
+            bank_id=bank_id,
+            content=content,
+        )
+
+    return _run_hindsight_operation(
+        operation,
+        bank_id,
+        content,
+    )
+
+
+def _hindsight_reflect(
+    bank_id: str,
+    query: str,
+):
+    """
+    Streamlit-safe Hindsight reflect.
+    """
+
+    async def operation(
+        client,
+        bank_id,
+        query,
+    ):
+        return await client.areflect(
+            bank_id=bank_id,
+            query=query,
+        )
+
+    return _run_hindsight_operation(
+        operation,
+        bank_id,
+        query,
+    )
+
+
+# =====================================================================
+# HINDSIGHT RESPONSE PARSING
+# =====================================================================
 
 def extract_recall_text(response) -> str:
     """
-    Safely extracts text from a Hindsight recall response.
-
-    Primary response structure:
-        response.results
-
-    Includes fallbacks for older/different response formats.
+    Safely extracts memory text from a Hindsight recall response.
     """
 
     if response is None:
@@ -180,18 +292,17 @@ def extract_recall_text(response) -> str:
     results = getattr(
         response,
         "results",
-        None
+        None,
     )
 
     if results is None and isinstance(response, dict):
         results = response.get("results")
 
-    # Backward compatibility
     if results is None:
         results = getattr(
             response,
             "memories",
-            None
+            None,
         )
 
     if results is None and isinstance(response, dict):
@@ -221,13 +332,11 @@ def extract_recall_text(response) -> str:
                 items.append(text_val)
 
             elif hasattr(item, "text"):
-
                 items.append(
                     getattr(item, "text")
                 )
 
             elif hasattr(item, "content"):
-
                 items.append(
                     getattr(item, "content")
                 )
@@ -246,16 +355,9 @@ def extract_recall_text(response) -> str:
     return str(results).strip()
 
 
-# ============================================================
-# HINDSIGHT REFLECT PARSER
-# ============================================================
-
 def extract_reflect_text(response) -> str:
     """
     Safely extracts text from a Hindsight reflect response.
-
-    Primary response structure:
-        response.text
     """
 
     if response is None:
@@ -264,18 +366,17 @@ def extract_reflect_text(response) -> str:
     text = getattr(
         response,
         "text",
-        None
+        None,
     )
 
     if text is None and isinstance(response, dict):
         text = response.get("text")
 
-    # Backward compatibility
     if text is None:
         text = getattr(
             response,
             "observations",
-            None
+            None,
         )
 
     if text is None and isinstance(response, dict):
@@ -286,99 +387,32 @@ def extract_reflect_text(response) -> str:
 
     return str(text).strip()
 
-def recall_updated_context(employee_id: str) -> dict:
-    """
-    Re-recall the employee and team memory after a new update
-    has been retained in Hindsight.
-    """
 
-    personal_context = "No personal context available."
-    team_context = "No team context available."
-
-    if not hindsight_client:
-        return {
-            "personal_context": personal_context,
-            "team_context": team_context,
-        }
-
-    # --------------------------------------------------------
-    # Employee memory
-    # --------------------------------------------------------
-
-    try:
-        personal_recall_resp = hindsight_client.recall(
-            bank_id=employee_id,
-            query=(
-                "What are the most recent operational updates, "
-                "completed work, blockers, and employee responses?"
-            ),
-        )
-
-        personal_context = extract_recall_text(
-            personal_recall_resp
-        )
-
-    except Exception as e:
-        logging.warning(
-            f"Hindsight personal refresh failed "
-            f"for '{employee_id}': {e}"
-        )
-
-    # --------------------------------------------------------
-    # Team memory
-    # --------------------------------------------------------
-
-    try:
-        team_recall_resp = hindsight_client.recall(
-            bank_id="team_ops",
-            query=(
-                "What are the most recent cross-team operational "
-                "updates, completed work, blockers, and dependencies?"
-            ),
-        )
-
-        team_context = extract_recall_text(
-            team_recall_resp
-        )
-
-    except Exception as e:
-        logging.warning(
-            f"Hindsight team_ops refresh failed: {e}"
-        )
-
-    return {
-        "personal_context": personal_context,
-        "team_context": team_context,
-    }
-# ============================================================
+# =====================================================================
 # PROACTIVE CHECK-IN QUESTION GENERATOR
-# ============================================================
+# =====================================================================
 
 def get_proactive_checkin_question(
-    employee_id: str
+    employee_id: str,
 ) -> dict:
     """
-    Steps 2–6:
-
     Fuses:
-        Day 10 raw signals
-        +
-        Hindsight employee memory
-        +
-        Hindsight team_ops memory
 
-    to generate ONE targeted,
-    zero-friction verification question.
+        Day 10 system signals
+        +
+        Hindsight personal memory
+        +
+        Hindsight team memory
+        ↓
+        Groq
+        ↓
+        ONE targeted question
     """
 
     employee_name = EMPLOYEE_NAMES.get(
         employee_id,
-        employee_id
+        employee_id,
     )
-
-    # --------------------------------------------------------
-    # Step 2: Load Day 10 signals
-    # --------------------------------------------------------
 
     raw_signals = get_mock_signals_for_employee(
         employee_id
@@ -389,41 +423,38 @@ def get_proactive_checkin_question(
         f"signals for {employee_name}:"
     )
 
-    for sig in raw_signals:
-        print(f" • {sig}")
+    for signal in raw_signals:
+        print(f" • {signal}")
 
     signals_text = "\n".join(
         f"- {signal}"
         for signal in raw_signals
     )
 
-    # --------------------------------------------------------
-    # Step 3: Personal Hindsight recall
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Hindsight Personal Recall
+    # ---------------------------------------------------------------
 
     print(
-        f"\n🧠 [Step 3] Executing Hindsight "
-        f"TEMPR Recall on personal bank: "
-        f"'{employee_id}'..."
+        f"\n🧠 [Step 3] Executing Hindsight TEMPR Recall "
+        f"on personal bank: '{employee_id}'..."
     )
 
     personal_context = (
         "No previous individual history found."
     )
 
-    if hindsight_client:
+    if HINDSIGHT_API_KEY:
 
         try:
 
-            personal_recall_resp = (
-                hindsight_client.recall(
-                    bank_id=employee_id,
-                    query=(
-                        "What ongoing tasks, blockers, "
-                        "or tickets was this employee "
-                        "working on recently?"
-                    )
-                )
+            personal_recall_resp = _hindsight_recall(
+                bank_id=employee_id,
+                query=(
+                    "What ongoing tasks, blockers, "
+                    "or tickets was this employee "
+                    "working on recently?"
+                ),
             )
 
             personal_context = extract_recall_text(
@@ -433,42 +464,41 @@ def get_proactive_checkin_question(
         except Exception as e:
 
             logging.warning(
-                f"Hindsight personal recall failed "
-                f"for '{employee_id}': {e}"
+                "Hindsight personal recall failed "
+                "for '%s': %s",
+                employee_id,
+                e,
             )
 
             print(
                 f" ⚠️ Could not retrieve personal memory "
-                f"for {employee_id}. "
-                f"Proceeding with signal context."
+                f"for {employee_id}."
             )
 
-    # --------------------------------------------------------
-    # Step 4: Team Hindsight recall
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Hindsight Team Recall
+    # ---------------------------------------------------------------
 
     print(
-        "\n🌐 [Step 4] Executing Hindsight "
-        "TEMPR Recall on team bank: 'team_ops'..."
+        "\n🌐 [Step 4] Executing Hindsight TEMPR Recall "
+        "on team bank: 'team_ops'..."
     )
 
     team_context = (
         "No team operations history found."
     )
 
-    if hindsight_client:
+    if HINDSIGHT_API_KEY:
 
         try:
 
-            team_recall_resp = (
-                hindsight_client.recall(
-                    bank_id="team_ops",
-                    query=(
-                        "What cross-team deployment "
-                        "updates or blockers were recently "
-                        "resolved or created?"
-                    )
-                )
+            team_recall_resp = _hindsight_recall(
+                bank_id="team_ops",
+                query=(
+                    "What cross-team deployment "
+                    "updates or blockers were recently "
+                    "resolved or created?"
+                ),
             )
 
             team_context = extract_recall_text(
@@ -478,17 +508,17 @@ def get_proactive_checkin_question(
         except Exception as e:
 
             logging.warning(
-                f"Hindsight team_ops recall failed: {e}"
+                "Hindsight team_ops recall failed: %s",
+                e,
             )
 
             print(
-                " ⚠️ Could not retrieve team_ops memory. "
-                "Proceeding with personal context."
+                " ⚠️ Could not retrieve team_ops memory."
             )
 
-    # --------------------------------------------------------
-    # Step 5 & 6: Groq reasoning
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Groq reasoning
+    # ---------------------------------------------------------------
 
     print(
         "\n⚡ [Step 5 & 6] Groq reasoning over context "
@@ -497,11 +527,10 @@ def get_proactive_checkin_question(
 
     if not groq_client:
 
-        fallback_q = (
+        fallback_question = (
             f"I noticed automated activity for "
-            f"{employee_name}. "
-            f"Could you confirm if your task is "
-            f"on track for deployment?"
+            f"{employee_name}. Could you confirm "
+            f"if your task is on track?"
         )
 
         return {
@@ -510,7 +539,7 @@ def get_proactive_checkin_question(
             "raw_signals": raw_signals,
             "personal_context": personal_context,
             "team_context": team_context,
-            "proactive_question": fallback_q
+            "proactive_question": fallback_question,
         }
 
     prompt = f"""
@@ -521,20 +550,16 @@ with {employee_name}.
 CONTEXT PROVIDED:
 
 1. RAW DAY 10 AUTOMATED SIGNALS
-(System Activity Evidence from GitHub/CI/CD today):
-
+(System Activity Evidence):
 {signals_text}
 
 2. HISTORICAL EMPLOYEE MEMORY
-(from Hindsight Memory Bank '{employee_id}'):
-
+(Hindsight Memory Bank '{employee_id}'):
 {personal_context}
 
 3. CROSS-TEAM DEPENDENCIES
-(from Hindsight Memory Bank 'team_ops'):
-
+(Hindsight Memory Bank 'team_ops'):
 {team_context}
-
 
 REASONING STEPS:
 
@@ -544,39 +569,25 @@ REASONING STEPS:
 2. Identify what previous task or blocker was unresolved,
    or what dependency was recently cleared.
 
-3. Determine what specific information is STILL UNCERTAIN
-   such as final verification, an unblocked next step,
-   or a remaining blocker.
+3. Determine what specific information is STILL UNCERTAIN.
 
-4. Formulate EXACTLY ONE concise,
-   highly specific verification question.
-
+4. Formulate EXACTLY ONE concise verification question.
 
 STRICT INSTRUCTIONS:
 
 - Treat automated system activity as evidence,
   NOT employee confirmation.
-
-- NEVER ask open-ended questions like:
+- NEVER ask:
   "What did you do today?"
-  or
-  "Can you summarize your work?"
-
-- DO NOT ask the employee to repeat information
-  that is already established in the system activity.
-
-- Focus strictly on unresolved status, next steps,
-  blockers, dependencies, or final confirmation.
-
-- NEVER invent facts or hallucinate unmentioned tasks
-  or tools.
-
-- Generate ONLY ONE single question.
-
-- The question must be 1–2 sentences maximum.
-
-- Keep it extremely simple for the employee
-  to answer in a few words.
+- NEVER ask open-ended status-report questions.
+- DO NOT ask the employee to repeat information already
+  established by system activity.
+- Focus on unresolved status, next steps, blockers,
+  dependencies, or final confirmation.
+- NEVER invent facts.
+- NEVER hallucinate tasks or tools.
+- Generate ONLY ONE question.
+- Keep it extremely simple to answer in a few words.
 
 PROACTIVE QUESTION:
 """
@@ -588,35 +599,36 @@ PROACTIVE QUESTION:
             messages=[
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": prompt,
                 }
             ],
-            temperature=0.3
+            temperature=0.3,
         )
 
-        if not response or not response.choices:
+        if (
+            not response
+            or not response.choices
+        ):
             raise ValueError(
-                "Empty completion response received "
-                "from Groq API."
+                "Empty completion response."
             )
 
         question = (
-            response
-            .choices[0]
-            .message
-            .content
+            response.choices[0]
+            .message.content
             .strip()
         )
 
     except Exception as e:
 
         logging.error(
-            f"Groq question generation failed: {e}"
+            "Groq question generation failed: %s",
+            e,
         )
 
         question = (
-            f"I observed today's background activity "
-            f"for {employee_name}. "
+            f"I observed today's background "
+            f"activity for {employee_name}. "
             f"Is everything ready for the upcoming "
             f"release, or is anything blocked?"
         )
@@ -627,26 +639,28 @@ PROACTIVE QUESTION:
         "raw_signals": raw_signals,
         "personal_context": personal_context,
         "team_context": team_context,
-        "proactive_question": question
+        "proactive_question": question,
     }
 
 
-# ============================================================
-# INTERPRET SHORT EMPLOYEE RESPONSE
-# ============================================================
+# =====================================================================
+# SHORT RESPONSE INTERPRETER
+# =====================================================================
 
 def interpret_short_response(
     employee_name: str,
     question_asked: str,
-    user_response: str
+    user_response: str,
 ) -> str:
     """
-    Converts a short employee response into
-    a concise factual statement.
+    Converts a short employee response into a concise
+    factual statement.
     """
 
-    if not user_response or not user_response.strip():
-
+    if (
+        not user_response
+        or not user_response.strip()
+    ):
         return (
             f"{employee_name} provided an empty "
             f"check-in response."
@@ -661,8 +675,8 @@ def interpret_short_response(
         )
 
     prompt = f"""
-Convert the employee's short response into a single,
-concise, unambiguous factual statement.
+Convert the employee's short response into
+a single, concise, unambiguous factual statement.
 
 Employee Name:
 {employee_name}
@@ -675,21 +689,12 @@ Short Employee Response:
 
 INSTRUCTIONS:
 
-- Output ONLY a single factual sentence.
-- Describe what happened or what the employee confirmed.
-- Do NOT output extra commentary.
-- Do NOT invent information.
-
-Example:
-
-Question:
-"Is the CORS fix pushed to staging?"
-
-Response:
-"Yep"
-
-Output:
-"Alice confirmed that the CORS fix was pushed to staging."
+- Output ONLY one factual sentence.
+- Describe ONLY what the employee's response
+  explicitly confirms.
+- Do NOT infer information that was not stated.
+- Do NOT add extra commentary.
+- Do NOT add conversational filler.
 
 FACTUAL STATEMENT:
 """
@@ -701,27 +706,25 @@ FACTUAL STATEMENT:
             messages=[
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": prompt,
                 }
             ],
-            temperature=0.1
+            temperature=0.1,
         )
 
         if response and response.choices:
 
             return (
-                response
-                .choices[0]
-                .message
-                .content
+                response.choices[0]
+                .message.content
                 .strip()
             )
 
     except Exception as e:
 
         logging.warning(
-            "Groq short response interpretation "
-            f"failed: {e}"
+            "Groq short response interpretation failed: %s",
+            e,
         )
 
     return (
@@ -731,17 +734,17 @@ FACTUAL STATEMENT:
     )
 
 
-# ============================================================
+# =====================================================================
 # PROCESS & RETAIN EMPLOYEE RESPONSE
-# ============================================================
+# =====================================================================
 
 def process_employee_response(
     employee_id: str,
     user_response: str,
-    question_asked: str
+    question_asked: str,
 ) -> dict:
     """
-    Steps 7–9:
+    Steps 7-9:
 
     1. Interpret short response.
     2. Create timestamped employee memory.
@@ -751,26 +754,24 @@ def process_employee_response(
 
     employee_name = EMPLOYEE_NAMES.get(
         employee_id,
-        employee_id
+        employee_id,
     )
 
     timestamp = datetime.now(
         timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
-    # --------------------------------------------------------
-    # Step 8: Interpret response
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Step 8
+    # ---------------------------------------------------------------
 
     factual_update = interpret_short_response(
         employee_name,
         question_asked,
-        user_response
+        user_response,
     )
-
-    # --------------------------------------------------------
-    # Employee bank entry
-    # --------------------------------------------------------
 
     employee_bank_entry = (
         f"[{timestamp}] "
@@ -780,19 +781,15 @@ def process_employee_response(
         f"Factual Interpretation: {factual_update}"
     )
 
-    # --------------------------------------------------------
-    # Team bank entry
-    # --------------------------------------------------------
-
     team_ops_entry = (
         f"[{timestamp}] {factual_update}"
     )
 
-    # --------------------------------------------------------
-    # Step 9: Retain in Hindsight
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Step 9 — Employee bank
+    # ---------------------------------------------------------------
 
-    if hindsight_client:
+    if HINDSIGHT_API_KEY:
 
         print(
             f"\n💾 [Step 9] Committing update to "
@@ -801,22 +798,32 @@ def process_employee_response(
 
         try:
 
-            hindsight_client.retain(
+            _hindsight_retain(
                 bank_id=employee_id,
-                content=employee_bank_entry
+                content=employee_bank_entry,
+            )
+
+            print(
+                f" ✅ Update retained in "
+                f"'{employee_id}'."
             )
 
         except Exception as e:
 
             logging.error(
-                f"Failed to retain update to "
-                f"'{employee_id}': {e}"
+                "Failed to retain update to '%s': %s",
+                employee_id,
+                e,
             )
 
             print(
                 f" ⚠️ Retain operation failed for "
                 f"bank '{employee_id}'."
             )
+
+        # -----------------------------------------------------------
+        # Team bank
+        # -----------------------------------------------------------
 
         print(
             "🌐 [Step 9] Syncing concise fact "
@@ -825,16 +832,22 @@ def process_employee_response(
 
         try:
 
-            hindsight_client.retain(
+            _hindsight_retain(
                 bank_id="team_ops",
-                content=team_ops_entry
+                content=team_ops_entry,
+            )
+
+            print(
+                " ✅ Concise fact retained in "
+                "'team_ops'."
             )
 
         except Exception as e:
 
             logging.error(
-                f"Failed to retain update to "
-                f"'team_ops': {e}"
+                "Failed to retain update to "
+                "'team_ops': %s",
+                e,
             )
 
             print(
@@ -846,7 +859,7 @@ def process_employee_response(
 
         print(
             "\n⚠️ Hindsight client offline. "
-            "Skipping live memory retention."
+            "Skipping memory retention."
         )
 
     return {
@@ -854,33 +867,121 @@ def process_employee_response(
         "timestamp": timestamp,
         "factual_update": factual_update,
         "message": (
-            f"Update successfully saved to "
-            f"Hindsight memory for {employee_name}!"
-        )
+            f"Update successfully processed "
+            f"for {employee_name}."
+        ),
     }
 
 
-# ============================================================
+# =====================================================================
+# REFRESH HINDSIGHT CONTEXT
+# =====================================================================
+
+def recall_updated_context(
+    employee_id: str,
+) -> dict:
+    """
+    Re-recall the employee and team memory after
+    a new update has been retained.
+    """
+
+    personal_context = (
+        "No updated personal context available."
+    )
+
+    team_context = (
+        "No updated team context available."
+    )
+
+    if not HINDSIGHT_API_KEY:
+
+        return {
+            "personal_context": personal_context,
+            "team_context": team_context,
+        }
+
+    # ---------------------------------------------------------------
+    # Personal memory
+    # ---------------------------------------------------------------
+
+    try:
+
+        personal_recall_resp = _hindsight_recall(
+            bank_id=employee_id,
+            query=(
+                "What are the most recent operational "
+                "updates, completed work, blockers, "
+                "and employee responses?"
+            ),
+        )
+
+        personal_context = extract_recall_text(
+            personal_recall_resp
+        )
+
+    except Exception as e:
+
+        logging.warning(
+            "Hindsight personal refresh failed "
+            "for '%s': %s",
+            employee_id,
+            e,
+        )
+
+    # ---------------------------------------------------------------
+    # Team memory
+    # ---------------------------------------------------------------
+
+    try:
+
+        team_recall_resp = _hindsight_recall(
+            bank_id="team_ops",
+            query=(
+                "What are the most recent cross-team "
+                "operational updates, completed work, "
+                "blockers, and dependencies?"
+            ),
+        )
+
+        team_context = extract_recall_text(
+            team_recall_resp
+        )
+
+    except Exception as e:
+
+        logging.warning(
+            "Hindsight team_ops refresh failed: %s",
+            e,
+        )
+
+    return {
+        "personal_context": personal_context,
+        "team_context": team_context,
+    }
+
+
+# =====================================================================
 # MANAGER EXECUTIVE DASHBOARD
-# ============================================================
+# =====================================================================
 
 def generate_manager_dashboard_summary() -> str:
     """
     Step 10:
 
-    Gathers operational context from:
+    Gathers operational context across:
+
         emp_alice
         emp_bob
         emp_charlie
         team_ops
 
-    Uses Hindsight reflect/recall and Groq to
-    produce an executive status report.
+    using Hindsight reflect with recall fallback,
+    then uses Groq for executive synthesis.
     """
 
     print(
-        "\n📊 [Step 10] Gathering operational context "
-        "across emp_alice, emp_bob, emp_charlie, team_ops..."
+        "\n📊 [Step 10] Gathering operational "
+        "context across all memory banks..."
     )
 
     all_reflections = []
@@ -889,12 +990,12 @@ def generate_manager_dashboard_summary() -> str:
         "emp_alice",
         "emp_bob",
         "emp_charlie",
-        "team_ops"
+        "team_ops",
     ]
 
     for bank_id in target_banks:
 
-        if not hindsight_client:
+        if not HINDSIGHT_API_KEY:
 
             all_reflections.append(
                 f"--- Bank: {bank_id} ---\n"
@@ -905,39 +1006,45 @@ def generate_manager_dashboard_summary() -> str:
 
         try:
 
-            reflect_resp = hindsight_client.reflect(
+            reflect_resp = _hindsight_reflect(
                 bank_id=bank_id,
                 query=(
                     "What are the current operational "
                     "observations, completed milestones, "
                     "and active bottlenecks?"
-                )
+                ),
             )
 
-            obs = extract_reflect_text(
+            observations = extract_reflect_text(
                 reflect_resp
             )
 
             all_reflections.append(
-                f"--- Bank: {bank_id} ---\n{obs}"
+                f"--- Bank: {bank_id} ---\n"
+                f"{observations}"
             )
 
         except Exception as e:
 
-            logging.info(
-                f"Reflect failed for bank '{bank_id}', "
-                f"falling back to TEMPR recall: {e}"
+            logging.warning(
+                "Reflect failed for bank '%s': %s",
+                bank_id,
+                e,
             )
+
+            # -------------------------------------------------------
+            # Recall fallback
+            # -------------------------------------------------------
 
             try:
 
-                recall_resp = hindsight_client.recall(
+                recall_resp = _hindsight_recall(
                     bank_id=bank_id,
                     query=(
                         "Summary of current operational "
                         "status, completed work, "
                         "and unresolved blockers"
-                    )
+                    ),
                 )
 
                 all_reflections.append(
@@ -945,11 +1052,13 @@ def generate_manager_dashboard_summary() -> str:
                     f"{extract_recall_text(recall_resp)}"
                 )
 
-            except Exception as recall_err:
+            except Exception as recall_error:
 
                 logging.error(
-                    f"Recall fallback also failed "
-                    f"for bank '{bank_id}': {recall_err}"
+                    "Recall fallback also failed "
+                    "for bank '%s': %s",
+                    bank_id,
+                    recall_error,
                 )
 
                 all_reflections.append(
@@ -961,33 +1070,36 @@ def generate_manager_dashboard_summary() -> str:
         all_reflections
     )
 
-    # --------------------------------------------------------
-    # Offline mode
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Groq synthesis
+    # ---------------------------------------------------------------
 
     if not groq_client:
 
         return (
-            "### Executive Summary (Offline Mode)\n\n"
+            "### Executive Summary "
+            "(Offline Mode)\n\n"
             "Collected Context:\n"
             f"{combined_reflections}"
         )
 
     print(
-        "⚡ Generating Manager Executive Dashboard "
-        "via Groq..."
+        "⚡ Generating Manager Executive "
+        "Dashboard via Groq..."
     )
 
     prompt = f"""
 You are an Executive Operations Assistant.
 
 Synthesize the following Hindsight memory context
-from these team banks:
+from the team banks:
 
-- emp_alice
-- emp_bob
-- emp_charlie
-- team_ops
+emp_alice
+emp_bob
+emp_charlie
+team_ops
+
+into a clean executive status report.
 
 REFLECTED MEMORY DATA:
 
@@ -995,28 +1107,30 @@ REFLECTED MEMORY DATA:
 
 INSTRUCTIONS:
 
-- Focus on current progress.
-- Focus on completed work.
-- Identify unresolved blockers.
-- Identify dependencies.
-- Identify risks and uncertainties.
-- Highlight important team updates.
-- Do NOT expose raw conversational transcripts.
-- Do NOT expose internal debug information.
-- Do NOT invent facts.
-- Present a concise operational overview.
+Focus on:
+
+1. Current progress
+2. Completed work
+3. Unresolved blockers
+4. Dependencies
+5. Risks and uncertainties
+6. Key team updates
+7. Next steps
+
+Do NOT expose raw conversational transcripts
+or internal debug details.
 
 FORMAT:
 
-1. 🎯 Current Progress & Completed Milestones
+### 🎯 Current Progress & Completed Milestones
 
-2. ⚠️ Active Blockers & Dependencies
+### ⚠️ Active Blockers & Dependencies
 
-3. 🚀 Release Risks & Next Steps
+### 🚀 Release Risks & Next Steps
 
-4. 📈 Team Operational Velocity
+### 📈 Team Operational Velocity
 
-Use clean markdown headers and concise bullet points.
+Keep the report concise and professional.
 """
 
     try:
@@ -1026,19 +1140,17 @@ Use clean markdown headers and concise bullet points.
             messages=[
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": prompt,
                 }
             ],
-            temperature=0.2
+            temperature=0.2,
         )
 
         if response and response.choices:
 
             return (
-                response
-                .choices[0]
-                .message
-                .content
+                response.choices[0]
+                .message.content
                 .strip()
             )
 
@@ -1046,7 +1158,8 @@ Use clean markdown headers and concise bullet points.
 
         logging.error(
             "Groq manager dashboard synthesis "
-            f"failed: {e}"
+            "failed: %s",
+            e,
         )
 
     return (
@@ -1056,11 +1169,14 @@ Use clean markdown headers and concise bullet points.
     )
 
 
-# ============================================================
+# =====================================================================
 # COMPLETE DEMO FLOW
-# ============================================================
+# =====================================================================
 
 def run_complete_demo():
+    """
+    Complete command-line demonstration.
+    """
 
     print(
         "=================================================================="
@@ -1074,13 +1190,13 @@ def run_complete_demo():
         "=================================================================="
     )
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
     # Step 1
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
 
     print(
-        "\n📌 [Step 1] Initializing demo with "
-        "existing Days 1–9 seeded Hindsight memories."
+        "\n📌 [Step 1] Initializing demo with existing "
+        "Days 1–9 seeded Hindsight memories."
     )
 
     print(
@@ -1089,12 +1205,11 @@ def run_complete_demo():
         "'emp_charlie', 'team_ops'"
     )
 
-    # Target employee
     target_emp = "emp_alice"
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
     # Steps 2–6
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
 
     checkin_data = get_proactive_checkin_question(
         target_emp
@@ -1121,9 +1236,9 @@ def run_complete_demo():
         "------------------------------------------------------------------"
     )
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
     # Step 7
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
 
     simulated_user_reply = (
         "Yep, pushed to staging."
@@ -1134,16 +1249,16 @@ def run_complete_demo():
         f"RECEIVED: \"{simulated_user_reply}\""
     )
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
     # Steps 8–9
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
 
     process_result = process_employee_response(
         employee_id=target_emp,
         user_response=simulated_user_reply,
         question_asked=checkin_data[
             "proactive_question"
-        ]
+        ],
     )
 
     print(
@@ -1155,9 +1270,9 @@ def run_complete_demo():
         f"✅ {process_result['message']}"
     )
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
     # Step 10
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
 
     print(
         "\n------------------------------------------------------------------"
@@ -1176,27 +1291,49 @@ def run_complete_demo():
         generate_manager_dashboard_summary()
     )
 
-    print(dashboard_report)
+    print(
+        dashboard_report
+    )
 
     print(
         "\n=================================================================="
     )
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# =====================================================================
+# CLEANUP
+# =====================================================================
 
-if __name__ == "__main__":
-    try:
-        run_complete_demo()
-    finally:
-        try:
-            hindsight_client.close()
-        except Exception:
-            pass
+def close_clients():
+    """
+    Close the Groq client.
+
+    Hindsight clients are created and closed inside each isolated
+    async operation, so there is no persistent Hindsight session
+    to close here.
+    """
+
+    global groq_client
+
+    if groq_client is not None:
 
         try:
             groq_client.close()
+
         except Exception:
             pass
+
+        groq_client = None
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+
+if __name__ == "__main__":
+
+    try:
+        run_complete_demo()
+
+    finally:
+        close_clients()
