@@ -270,27 +270,17 @@ if view_mode == "👤 Employee Check-In":
                         "No team context available.",
                     )
                 )
-
+                
             # -------------------------------------------------------
             # PROACTIVE QUESTION
             # -------------------------------------------------------
 
-            st.markdown(
-                f"""
-                <div class="agent-question">
+            with st.container(border=True):
+                st.markdown("### 📩 Agent Question")
 
-                    <div class="agent-question-title">
-                        📩 Agent Question
-                    </div>
-
-                    <div class="agent-question-text">
-                        "{data['proactive_question']}"
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                st.info(
+                    data["proactive_question"]
+                )
 
             # -------------------------------------------------------
             # RESPONSE
