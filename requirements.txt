@@ -1,0 +1,5 @@
+hindsight-client
+hindsight-litellm
+openai
+python-dotenv
+streamlit

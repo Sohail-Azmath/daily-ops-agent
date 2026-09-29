@@ -1,0 +1,14 @@
+# Environment variables (CRITICAL)
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+ENV/
+*.egg-info/
+
+# Streamlit
+.streamlit/
